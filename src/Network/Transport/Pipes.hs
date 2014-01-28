@@ -6,27 +6,28 @@ module Network.Transport.Pipes (createTransport) where
 import Control.Monad (when, unless)
 import Control.Exception (IOException, handle)
 import Control.Concurrent.MVar
+import Control.Concurrent.Chan (Chan, newChan, readChan, writeChan)
 import Control.Concurrent (threadDelay)
 import Data.IORef
 import Data.Word
-import Data.Sequence (Seq, (<|))
-import qualified Data.Sequence as Seq
+import Data.Map (Map)
+import qualified Data.Map as Map (empty, insert, size, delete, findWithDefault)
 import qualified Data.Foldable as F
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as BSC (pack, length, append, empty)
 import Data.ByteString.Lazy.Char8 (fromStrict, toStrict)
 import Data.Binary (Binary, Get, encode, decode, put, get)
 import System.Random (randomIO)
-import System.Posix.Files (createNamedPipe, unionFileModes, ownerReadMode, ownerWriteMode)
+import System.Posix.Files (FilePath, createNamedPipe, unionFileModes, ownerReadMode, ownerWriteMode)
 import System.Posix.Types (Fd)
 import System.Directory (removeFile)
 import qualified "unix-bytestring" System.Posix.IO.ByteString as PIO
 import System.Posix.IO as PIO (openFd, closeFd, OpenFileFlags(..), OpenMode(ReadOnly, WriteOnly))
 import Network.Transport
-import Network.Transport.Internal (tryIO, encodeInt32, decodeInt32, asyncWhenCancelled)
+import Network.Transport.Internal (tryIO, encodeInt32, decodeInt32, asyncWhenCancelled, void)
 
-data TransportState = State { endpoints   :: !(Seq EndPoint)
-                            , connections :: !(Seq Connection)
+data TransportState = State { endpoints   :: !(Map EndPointAddress (Chan Event))
+                            , connections :: !(Map EndPointAddress ConnectionId)
                             , status      :: !TransportStatus
                             }
 
@@ -130,59 +131,69 @@ readEvent fd lock = do
 --
 createTransport :: IO (Either IOException Transport)
 createTransport = do
-  state <- newMVar State { endpoints = Seq.empty
-                         , connections = Seq.empty
+  state <- newMVar State { endpoints = Map.empty
+                         , connections = Map.empty
                          , status = TransportValid
                          }
-  tryIO $ return Transport { newEndPoint    = apiNewEndPoint state
-                           , closeTransport = apiCloseTransport state
-                           }
-
--- | Create a new endpoint
-apiNewEndPoint :: MVar TransportState -> IO (Either (TransportError NewEndPointErrorCode) EndPoint)
-apiNewEndPoint state = do
   uid <- randomIO :: IO Word64
   let filename = "/tmp/pipe_"++show uid
   createNamedPipe filename $ unionFileModes ownerReadMode ownerWriteMode
   fd <- PIO.openFd filename PIO.ReadOnly Nothing fileFlags
   lock <- newMVar ()
-  let addr = EndPointAddress . BSC.pack $ filename
-      endp = EndPoint { receive       = readEvent fd lock
-                      , address       = addr
-                      , connect       = apiConnect addr state
-                      , closeEndPoint = apiCloseEndPoint fd addr
-                      , newMulticastGroup     = return . Left $ newMulticastGroupError
-                      , resolveMulticastGroup = return . Left . const resolveMulticastGroupError
-                      }
-  modifyMVar_ state $
-    \st -> return (State { endpoints = endp <| (endpoints st)
-                         , connections = connections st
-                         , status = status st
-                         })
-  return . Right $ endp
-  where
-    newMulticastGroupError =
-      TransportError NewMulticastGroupUnsupported "Multicast not supported"
-    resolveMulticastGroupError =
-      TransportError ResolveMulticastGroupUnsupported "Multicast not supported"
+  try . asyncWhenCancelled closeTransport $ readEvent fd lock
+  tryIO $ return Transport { newEndPoint    = apiNewEndPoint state filename
+                           , closeTransport = apiCloseTransport state filename fd
+                           }
 
 -- | Close the transport
-apiCloseTransport :: MVar TransportState -> IO ()
-apiCloseTransport state = do
+apiCloseTransport :: MVar TransportState -> FilePath -> Fd -> IO ()
+apiCloseTransport state pipe fd = do
   st <- readMVar state
-  asyncWhenCancelled return $ do
+  void . tryIO . asyncWhenCancelled return $ do
     case (status st) of
       TransportValid  -> do
         -- Close open connections
         F.mapM_ close (connections st)
         -- Close local endpoints
         F.mapM_ closeEndPoint (endpoints st)
+        PIO.closeFd fd
+        removeFile pipe
         modifyMVar_ state $
-          \_ -> return State { endpoints = Seq.empty
-                             , connections = Seq.empty
+          \_ -> return State { endpoints = Map.empty
+                             , connections = Map.empty
                              , status = TransportClosed
                              }
       TransportClosed -> return ()
+
+-- | Create a new endpoint
+apiNewEndPoint :: MVar TransportState -> FilePath
+               -> IO (Either (TransportError NewEndPointErrorCode) EndPoint)
+apiNewEndPoint state pipe = do
+  chan <- newChan
+  addr <- modifyMVar state $ \st -> do
+    let addr = EndPointAddress . BSC.pack $ (show pipe)++(show $ Map.size (endpoints st))
+    return $ insertEndPoint st addr chan
+  return . Right $ EndPoint { receive       = readChan chan
+                            , address       = addr
+                            , connect       = apiConnect addr state
+                            , closeEndPoint = apiCloseEndPoint addr state
+                            , newMulticastGroup     = return . Left $ newMulticastGroupError
+                            , resolveMulticastGroup = return . Left . const resolveMulticastGroupError
+                            }
+  where
+    newMulticastGroupError =
+      TransportError NewMulticastGroupUnsupported "Multicast not supported"
+    resolveMulticastGroupError =
+      TransportError ResolveMulticastGroupUnsupported "Multicast not supported"
+
+-- | Force-close the endpoint
+apiCloseEndPoint :: EndpointAddress -> MVar TransportState -> IO ()
+apiCloseEndPoint addr state =
+  asyncWhenCancelled return $ do
+    chan <- modifyMVar_ state $ \st -> do
+      let ch = lookupEndPoint st addr
+      return (removeEndPoint st addr, ch)
+    writeChan chan $ EndPointClosed
 
 -- | Create a new connection
 apiConnect :: EndPointAddress
@@ -225,10 +236,19 @@ apiClose fd connAlive =
       PIO.closeFd fd
     return False
 
--- | Force-close the endpoint
-apiCloseEndPoint :: Fd -> EndPointAddress -> IO ()
-apiCloseEndPoint fd addr =
-  asyncWhenCancelled return $ do
-    writeEvent fd $ EndPointClosed
-    PIO.closeFd fd
-    removeFile $ show addr
+-- | Endpoint accessors for the transport state
+--
+accEndPoint :: TransportState -> (Map EndPointAddress (Chan Event) -> Map EndPointAddress (Chan Event)) -> TransportState
+accEndPoint state f = State { endpoints = f (endpoints st)
+                            , connections = connections st
+                            , status = status st
+                            }
+
+insertEndPoint :: TransportState -> EndpointAddress -> Chan -> TransportState
+inserEndPoint state = accEndPoint state $ Map.insert
+
+removeEndPoint :: TransportState -> EndpointAddress -> TransportState
+removeEndPoint state = accEndPoint state $ Map.delete
+
+lookupEndPoint :: TransportState -> EndpointAddress -> Chan
+lookupEndPoint state = accEndPoint state $ Map.findWithDefault (error "Invalid endpoint")

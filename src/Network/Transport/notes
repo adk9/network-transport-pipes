@@ -1,0 +1,21 @@
+Network Transport Pipes Design Document:
+
+- new Transport creates a "data" file
+  - it also creates a background thread which polls this file for writes
+- new Endpoint creates a new "chan"
+  - receive Endpoint is simply a receive on the channel.
+  - cannot send data on an Endpoint.
+- new Connection (endpoint, endpoint address)
+  - choose a conn id
+  - send a control message to the remote process
+  - control data needs to be communicated out-of-band
+  - opens the file pointed to by the endpoint address.
+
+    	     Transport A			Transport B
+	 +-----------------+		   +------------------+
+	 |                 |		   |           	      |
+	 |    Endpoint 1   |		   |    Endpoint 1    |
+	 |                 |		   |           	      |
+	 |                 |		   |    Endpoint 2    |
+	 |                 |		   |                  |
+	 +-----------------+		   +------------------+
