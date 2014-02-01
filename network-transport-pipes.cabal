@@ -26,7 +26,7 @@ Library
                      unix-bytestring >= 0.3.5.3
   Exposed-modules:   Network.Transport.Pipes
 --  Extensions:        BangPatterns
-  ghc-options:       -Wall
+  ghc-options:       -Wall -threaded
   HS-Source-Dirs:    src
 
 Test-Suite TestPipes
@@ -35,5 +35,5 @@ Test-Suite TestPipes
                    network-transport-pipes >= 0.0.2.1,
                    network-transport-tests >= 0.1 && < 0.2
   Main-Is:         TestPipes.hs
-  ghc-options:     -Wall -fno-warn-unused-do-bind
+  ghc-options:     -Wall -fno-warn-unused-do-bind -threaded
   HS-Source-Dirs:  tests

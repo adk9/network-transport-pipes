@@ -3,37 +3,33 @@
 -- | Named Pipes implementation of the Transport API.
 module Network.Transport.Pipes (createTransport) where
 
-import Control.Monad (when, unless)
-import Control.Exception (IOException, handle)
+import Control.Monad (when, unless, zipWithM_, liftM)
+import Control.Exception (IOException, handle, throwIO)
 import Control.Concurrent.MVar
 import Control.Concurrent.Chan (Chan, newChan, readChan, writeChan)
-import Control.Concurrent (threadDelay)
+import Control.Concurrent (threadDelay, forkOS)
 import Data.IORef
 import Data.Word
 import Data.Map (Map)
-import qualified Data.Map as Map (empty, insert, size, delete, findWithDefault)
-import qualified Data.Foldable as F
+import qualified Data.Map as Map
 import Data.ByteString (ByteString)
-import qualified Data.ByteString.Char8 as BSC (pack, length, append, empty)
-import Data.ByteString.Lazy.Char8 (fromStrict, toStrict)
-import Data.Binary (Binary, Get, encode, decode, put, get)
+import qualified Data.ByteString.Char8 as BSC
 import System.Random (randomIO)
-import System.Posix.Files (FilePath, createNamedPipe, unionFileModes, ownerReadMode, ownerWriteMode)
+import System.Posix.Files (createNamedPipe, unionFileModes, ownerReadMode, ownerWriteMode)
 import System.Posix.Types (Fd)
 import System.Directory (removeFile)
 import qualified "unix-bytestring" System.Posix.IO.ByteString as PIO
 import System.Posix.IO as PIO (openFd, closeFd, OpenFileFlags(..), OpenMode(ReadOnly, WriteOnly))
 import Network.Transport
-import Network.Transport.Internal (tryIO, encodeInt32, decodeInt32, asyncWhenCancelled, void)
+import Network.Transport.Internal (tryIO, encodeInt32, decodeInt32, asyncWhenCancelled, void, prependLength, tryToEnum)
 
+-- Endpoint Pair (local, remote)
+type EndPointPair = (EndPointAddress, EndPointAddress)
+
+-- Global transport state
 data TransportState = State { endpoints   :: !(Map EndPointAddress (Chan Event))
-                            , connections :: !(Map EndPointAddress ConnectionId)
-                            , status      :: !TransportStatus
+                            , connections :: !(Map EndPointPair ConnectionId)
                             }
-
-data TransportStatus =
-    TransportValid
-  | TransportClosed
 
 fileFlags :: OpenFileFlags
 fileFlags = 
@@ -47,33 +43,15 @@ fileFlags =
     PIO.trunc     = False
   }
 
-------------------------------------------------------------------------------
-
-instance Binary Event where
-  put (Received cid msg)          = do put (0 :: Word8)
-                                       put cid
-                                       put msg
-  put (ConnectionClosed cid)      = do put (1 :: Word8)
-                                       put cid
-  put (ConnectionOpened cid _ ea) = do put (2 :: Word8)
-                                       put cid
-                                       put ea
-  put (ReceivedMulticast _ _)     = do put (3 :: Word8)
-  put EndPointClosed              = put (4 :: Word8)
-  put (ErrorEvent _)              = put (5 :: Word8)
-  get = do t <- get :: Get Word8
-           case t of
-             0 -> do cid <- get
-                     msg <- get
-                     return (Received cid msg)
-             1 -> do cid <- get
-                     return (ConnectionClosed cid)
-             2 -> do cid <- get
-                     ea <- get
-                     return (ConnectionOpened cid ReliableOrdered ea)
-             3 -> return (ReceivedMulticast (MulticastAddress BSC.empty) [])
-             4 -> return EndPointClosed
-             5 -> return (ErrorEvent (TransportError EventTransportFailed ""))
+-- | Control headers
+data ControlHeader =
+    -- | Tell the remote endpoint that we created a new connection
+    NewConnection
+    -- | Tell the remote endpoint we will no longer be using a connection
+  | CloseConnection
+    -- | Tell the remote endpoint that this is a data payload
+  | Data
+  deriving (Enum, Bounded, Show)
 
 ------------------------------------------------------------------------------
 
@@ -96,32 +74,55 @@ tryUntilNoIOErr action = mkBackoff >>= loop
 	   action
 
 -- TODO: Handle errors
-writeEvent :: Fd -> Event -> IO ()
-writeEvent fd ev = do
-  let msg = toStrict $ encode ev
-  cnt <- PIO.fdWrite fd $ BSC.append (encodeInt32 $ BSC.length msg) msg
-  unless (fromIntegral cnt == (BSC.length msg + 4)) $
-    error$ "Failed to write message in one go, length: "++ show (BSC.length msg) ++ "cnt: "++ show cnt
+writeFd :: Fd -> [ByteString] -> IO ()
+writeFd fd payload = do
+  let msg = BSC.concat payload
+  cnt <- PIO.fdWrite fd msg
+  unless ((fromIntegral cnt) == (BSC.length msg)) $
+    error$ "Failed to write message in one go, length: "++ show (BSC.length msg) ++"cnt: "++ show cnt
   return ()
 
 -- TODO: Handle errors
-readEvent :: Fd -> MVar () -> IO Event
-readEvent fd lock = do
+readFd :: MVar TransportState -> FilePath -> Fd -> MVar () -> IO Transport
+readFd state filename fd lock = do
   takeMVar lock
-  hdr <- spinread fd 4
-  msg <- spinread fd (decodeInt32 hdr)
-  putMVar lock ()
-  let ev = (decode $ fromStrict msg)
-  putStrLn $ "Received:"++(show ev)
-  return ev
+  hdr <- spinread 8 -- read the header (endpoint ID, cmd)
+  let addr = makeEndpoint filename $ decodeInt32 (BSC.take 4 hdr)
+  chan <- modifyMVar state $ \st -> return (st, lookupEndPoint st addr)
+  let cmd = (decodeInt32 . BSC.take 4 . BSC.drop 4) hdr
+  sz <- spinread 4
+  remoteaddr <- liftM EndPointAddress $ spinread (decodeInt32 sz)
+  case (tryToEnum cmd) of
+    Just NewConnection -> do
+      connId <- modifyMVar state $ \st -> do
+        let (cid, cst) = addConnection st (addr,remoteaddr)
+        return (cst, cid)
+      writeChan chan $ ConnectionOpened connId ReliableOrdered remoteaddr
+      putMVar lock ()
+      readFd state filename fd lock
+    Just CloseConnection -> do
+      connId <- modifyMVar state $ \st -> do
+        let cid = lookupConnection st (addr,remoteaddr)
+        return (removeConnection st (addr,remoteaddr), cid)
+      writeChan chan $ ConnectionClosed connId
+      putMVar lock ()
+      readFd state filename fd lock
+    Just Data -> do
+      connId <- modifyMVar state $ \st -> return (st, lookupConnection st (addr,remoteaddr))
+      msz <- spinread 4
+      msg <- spinread (decodeInt32 msz)
+      writeChan chan $ Received connId [msg]
+      putMVar lock ()
+      readFd state filename fd lock
+    Nothing -> throwIO $ userError "Invalid control request" 
   where
-    spinread :: Fd -> Int -> IO ByteString
-    spinread fd desired = do
+    spinread :: Int -> IO ByteString
+    spinread desired = do
       msg <- tryUntilNoIOErr$ PIO.fdRead fd (fromIntegral desired)
       case BSC.length msg of
         n | n == desired -> return msg
         0 -> do threadDelay (10*1000)
-                spinread fd desired
+                spinread desired
         l -> error$ "Inclomplete read expected either 0 bytes or complete msg ("++
              show desired ++" bytes) got "++ show l ++ " bytes"
 
@@ -131,48 +132,40 @@ readEvent fd lock = do
 --
 createTransport :: IO (Either IOException Transport)
 createTransport = do
-  state <- newMVar State { endpoints = Map.empty
+  state <- newMVar State { endpoints   = Map.empty
                          , connections = Map.empty
-                         , status = TransportValid
                          }
   uid <- randomIO :: IO Word64
   let filename = "/tmp/pipe_"++show uid
   createNamedPipe filename $ unionFileModes ownerReadMode ownerWriteMode
   fd <- PIO.openFd filename PIO.ReadOnly Nothing fileFlags
   lock <- newMVar ()
-  try . asyncWhenCancelled closeTransport $ readEvent fd lock
+  void $ forkOS $ void . tryIO . asyncWhenCancelled closeTransport $ readFd state filename fd lock
   tryIO $ return Transport { newEndPoint    = apiNewEndPoint state filename
                            , closeTransport = apiCloseTransport state filename fd
                            }
 
 -- | Close the transport
 apiCloseTransport :: MVar TransportState -> FilePath -> Fd -> IO ()
-apiCloseTransport state pipe fd = do
+apiCloseTransport state filename fd = do
   st <- readMVar state
   void . tryIO . asyncWhenCancelled return $ do
-    case (status st) of
-      TransportValid  -> do
-        -- Close open connections
-        F.mapM_ close (connections st)
-        -- Close local endpoints
-        F.mapM_ closeEndPoint (endpoints st)
-        PIO.closeFd fd
-        removeFile pipe
-        modifyMVar_ state $
-          \_ -> return State { endpoints = Map.empty
-                             , connections = Map.empty
-                             , status = TransportClosed
-                             }
-      TransportClosed -> return ()
+    -- TODO: close all connections.
+    zipWithM_ apiCloseEndPoint (Map.keys $ endpoints st) (repeat state)
+    PIO.closeFd fd
+    removeFile filename
+    modifyMVar_ state $ \_ -> return State { endpoints   = Map.empty
+                                           , connections = Map.empty
+                                           }
 
 -- | Create a new endpoint
 apiNewEndPoint :: MVar TransportState -> FilePath
                -> IO (Either (TransportError NewEndPointErrorCode) EndPoint)
-apiNewEndPoint state pipe = do
+apiNewEndPoint state filename = do
   chan <- newChan
   addr <- modifyMVar state $ \st -> do
-    let addr = EndPointAddress . BSC.pack $ (show pipe)++(show $ Map.size (endpoints st))
-    return $ insertEndPoint st addr chan
+    let addr = makeEndpoint filename $ Map.size (endpoints st)
+    return (addEndPoint st addr chan, addr)
   return . Right $ EndPoint { receive       = readChan chan
                             , address       = addr
                             , connect       = apiConnect addr state
@@ -187,68 +180,130 @@ apiNewEndPoint state pipe = do
       TransportError ResolveMulticastGroupUnsupported "Multicast not supported"
 
 -- | Force-close the endpoint
-apiCloseEndPoint :: EndpointAddress -> MVar TransportState -> IO ()
+apiCloseEndPoint :: EndPointAddress -> MVar TransportState -> IO ()
 apiCloseEndPoint addr state =
   asyncWhenCancelled return $ do
-    chan <- modifyMVar_ state $ \st -> do
+    chan <- modifyMVar state $ \st -> do
       let ch = lookupEndPoint st addr
       return (removeEndPoint st addr, ch)
     writeChan chan $ EndPointClosed
 
 -- | Create a new connection
-apiConnect :: EndPointAddress
-           -> MVar TransportState
-           -> EndPointAddress
-           -> Reliability
-           -> ConnectHints
-           -> IO (Either (TransportError ConnectErrorCode) Connection)
+apiConnect :: EndPointAddress -> MVar TransportState -> EndPointAddress
+           -> Reliability -> ConnectHints -> IO (Either (TransportError ConnectErrorCode) Connection)
 apiConnect myAddress state theirAddress _reliability _hints = do
-  fd <- PIO.openFd (show theirAddress) PIO.WriteOnly Nothing fileFlags
+  let (path, endId) = splitEndpoint theirAddress
   connAlive <- newMVar True
-  let conn = Connection { send  = apiSend fd connAlive
-                        , close = apiClose fd connAlive
-                        }
-  modifyMVar_ state $
-    \st -> return (State { endpoints = endpoints st
-                         , connections = conn <| (connections st)
-                         , status = status st
-                         })
-  writeEvent fd $ ConnectionOpened (fromIntegral fd) ReliableOrdered myAddress
-  return . Right $ conn
+  if (fst . splitEndpoint) myAddress == path
+    then connectToSelf (myAddress,theirAddress) state connAlive
+    else do
+    fd <- PIO.openFd path PIO.WriteOnly Nothing fileFlags
+    writeFd fd $ [encodeInt32 endId, encodeInt32 NewConnection, encodeAddress myAddress]
+    return . Right $ Connection { send  = apiSend fd endId myAddress connAlive
+                                , close = apiClose fd endId myAddress connAlive
+                                }
+
+-- May throw a TransportError ConnectErrorCode (if the local endpoint is closed)
+connectToSelf :: EndPointPair -> MVar TransportState -> MVar Bool
+              -> IO (Either (TransportError ConnectErrorCode) Connection)
+connectToSelf ep@(myAddress,theirAddress) state connAlive = do
+  (connId, chan) <- modifyMVar state $ \st -> do
+    let (cid, cst) = addConnection st ep
+    return (cst, (cid, lookupEndPoint st theirAddress))
+  writeChan chan $ ConnectionOpened (fromIntegral connId) ReliableOrdered myAddress
+  return . Right $ Connection
+      { send  = selfSend chan connId
+      , close = (modifyMVar_ state $ \st -> return $ removeConnection st ep) >> (selfClose chan connId)
+      }
+  where
+    selfSend :: Chan Event -> ConnectionId -> [ByteString] -> IO (Either (TransportError SendErrorCode) ())
+    selfSend chan connId msg = modifyMVar connAlive $ \alive -> do
+      if alive
+        then do
+        writeChan chan $ Received (fromIntegral connId) msg
+        return (alive, Right ())
+        else return (alive, Left (TransportError SendClosed "Connection closed"))
+
+    selfClose :: Chan Event -> ConnectionId -> IO ()
+    selfClose chan connId = do
+      modifyMVar_ connAlive $ \alive -> do
+      when alive $ writeChan chan $ ConnectionClosed (fromIntegral connId)
+      return False
 
 -- | Send a message over a connection
-apiSend :: Fd -> MVar Bool -> [ByteString] -> IO (Either (TransportError SendErrorCode) ())
-apiSend fd connAlive msg =
+apiSend :: Fd -> Int -> EndPointAddress -> MVar Bool -> [ByteString] -> IO (Either (TransportError SendErrorCode) ())
+apiSend fd endId addr connAlive msg =
   modifyMVar connAlive $ \alive ->
-    if alive
-      then do
-        writeEvent fd $ Received (fromIntegral fd) msg
-        return (alive, Right ())
-      else
-        return (alive, Left (TransportError SendFailed "Connection closed"))
+  if alive
+  then do
+    let hdr = [encodeInt32 endId, encodeInt32 Data, encodeAddress addr]
+    writeFd fd $ hdr ++ (prependLength msg)
+    return (alive, Right ())
+  else
+    return (alive, Left (TransportError SendFailed "Connection closed"))
 
 -- | Close a connection
-apiClose :: Fd -> MVar Bool -> IO ()
-apiClose fd connAlive =
+apiClose :: Fd -> Int -> EndPointAddress -> MVar Bool -> IO ()
+apiClose fd endId addr connAlive = do
   modifyMVar_ connAlive $ \alive -> do
     when alive $ do
-      writeEvent fd $ ConnectionClosed (fromIntegral fd)
+      writeFd fd [encodeInt32 endId, encodeInt32 CloseConnection, encodeAddress addr]
       PIO.closeFd fd
     return False
 
--- | Endpoint accessors for the transport state
+-- | Accessors for transport endpoints
 --
 accEndPoint :: TransportState -> (Map EndPointAddress (Chan Event) -> Map EndPointAddress (Chan Event)) -> TransportState
-accEndPoint state f = State { endpoints = f (endpoints st)
-                            , connections = connections st
-                            , status = status st
-                            }
+accEndPoint st f = State { endpoints   = f (endpoints st)
+                         , connections = connections st
+                         }
 
-insertEndPoint :: TransportState -> EndpointAddress -> Chan -> TransportState
-inserEndPoint state = accEndPoint state $ Map.insert
+-- | Endpoint Helpers
+--
+addEndPoint :: TransportState -> EndPointAddress -> Chan Event -> TransportState
+addEndPoint st a c = accEndPoint st $ Map.insert a c
 
-removeEndPoint :: TransportState -> EndpointAddress -> TransportState
-removeEndPoint state = accEndPoint state $ Map.delete
+removeEndPoint :: TransportState -> EndPointAddress -> TransportState
+removeEndPoint st a = accEndPoint st $ Map.delete a
 
-lookupEndPoint :: TransportState -> EndpointAddress -> Chan
-lookupEndPoint state = accEndPoint state $ Map.findWithDefault (error "Invalid endpoint")
+lookupEndPoint :: TransportState -> EndPointAddress -> Chan Event
+lookupEndPoint st a = Map.findWithDefault (error "Invalid endpoint") a (endpoints st)
+
+-- Join the endpoint path (path to the named pipe) and endpoint
+-- number to make a new endpoint address.
+makeEndpoint :: FilePath -> Int -> EndPointAddress
+makeEndpoint path endId = EndPointAddress . BSC.pack $ path++":"++(show endId)
+
+-- Split an endpoint address represented by e into its endpoint
+-- path (the path to the named pipe) and the endpoint number.
+splitEndpoint :: EndPointAddress -> (FilePath, Int)
+splitEndpoint (EndPointAddress e) = let (path, num) = BSC.break (== ':') e in
+  (BSC.unpack path, read (BSC.unpack $ BSC.drop 1 num) :: Int)
+
+-- Encode an endpoint address as a ByteString prepending it with its length
+encodeAddress :: EndPointAddress -> ByteString
+encodeAddress x = BSC.append (encodeInt32  $ BSC.length addr) addr
+  where addr = endPointAddressToByteString x
+
+-- | Accessors for transport connections
+--
+accConnection :: TransportState -> (Map EndPointPair ConnectionId -> Map EndPointPair ConnectionId) -> TransportState
+accConnection st f = State { endpoints   = endpoints st
+                           , connections = f (connections st)
+                         }
+
+-- Add a new connection, if it is not already present.
+addConnection :: TransportState -> EndPointPair -> (ConnectionId, TransportState)
+addConnection st p = 
+  case Map.lookup p (connections st) of
+    Just cid -> (cid, st)
+    Nothing -> (connId, accConnection st $ Map.insert p connId)
+      where
+        connId = fromIntegral $ Map.size (connections st) + 1
+
+removeConnection :: TransportState -> EndPointPair -> TransportState
+removeConnection st p = accConnection st $ Map.delete p
+
+lookupConnection :: TransportState -> EndPointPair -> ConnectionId
+lookupConnection st a = Map.findWithDefault (error "Invalid Connection") a (connections st)
+
