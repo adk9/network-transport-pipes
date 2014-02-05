@@ -15,20 +15,29 @@ import qualified Data.Map as Map
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as BSC
 import System.Random (randomIO)
-import System.Posix.Files (createNamedPipe, unionFileModes, ownerReadMode, ownerWriteMode)
+import System.Posix.Files (createNamedPipe, unionFileModes,
+                           ownerReadMode, ownerWriteMode)
 import System.Posix.Types (Fd)
 import System.Directory (removeFile)
 import qualified "unix-bytestring" System.Posix.IO.ByteString as PIO
-import System.Posix.IO as PIO (openFd, closeFd, OpenFileFlags(..), OpenMode(ReadOnly, WriteOnly))
+import System.Posix.IO as PIO (openFd, closeFd, OpenFileFlags(..),
+                               OpenMode(ReadOnly, WriteOnly))
 import Network.Transport
-import Network.Transport.Internal (tryIO, encodeInt32, decodeInt32, asyncWhenCancelled, void, prependLength, tryToEnum)
+import Network.Transport.Internal (tryIO, encodeInt32, decodeInt32, void,
+                                   asyncWhenCancelled, prependLength, tryToEnum)
 
--- Endpoint Pair (local, remote)
+-- EndPoint Map
+type EndPointMap = (Map EndPointAddress (Chan Event))
+
+-- Endpoint Pair (local endpoint, remote endpoint)
 type EndPointPair = (EndPointAddress, EndPointAddress)
 
+-- Connection Map
+type ConnectionMap = (Map EndPointPair (ConnectionId))
+
 -- Global transport state
-data TransportState = State { endpoints   :: !(Map EndPointAddress (Chan Event))
-                            , connections :: !(Map EndPointPair ConnectionId)
+data TransportState = State { endpoints   :: !EndPointMap
+                            , connections :: !ConnectionMap
                             }
 
 fileFlags :: OpenFileFlags
@@ -59,7 +68,7 @@ mkBackoff :: IO (IO ())
 mkBackoff = 
   do tref <- newIORef 1
      return$ do t <- readIORef tref
-		writeIORef tref (min maxwait (2 * t))
+                writeIORef tref (min maxwait (2 * t))
 		threadDelay t
  where 
    maxwait = 50 * 1000
@@ -79,7 +88,8 @@ writeFd fd payload = do
   let msg = BSC.concat payload
   cnt <- PIO.fdWrite fd msg
   unless ((fromIntegral cnt) == (BSC.length msg)) $
-    error$ "Failed to write message in one go, length: "++ show (BSC.length msg) ++"cnt: "++ show cnt
+    error$ "Failed to write message in one go, length: "++
+      show (BSC.length msg)++"cnt: "++ show cnt
   return ()
 
 -- TODO: Handle errors
@@ -108,7 +118,8 @@ readFd state filename fd lock = do
       putMVar lock ()
       readFd state filename fd lock
     Just Data -> do
-      connId <- modifyMVar state $ \st -> return (st, lookupConnection st (addr,remoteaddr))
+      connId <- modifyMVar state $ \st ->
+        return (st, lookupConnection st (addr,remoteaddr))
       msz <- spinread 4
       msg <- spinread (decodeInt32 msz)
       writeChan chan $ Received connId [msg]
@@ -123,7 +134,7 @@ readFd state filename fd lock = do
         n | n == desired -> return msg
         0 -> do threadDelay (10*1000)
                 spinread desired
-        l -> error$ "Inclomplete read expected either 0 bytes or complete msg ("++
+        l -> error$ "Incomplete read expected either 0 bytes or complete msg ("++
              show desired ++" bytes) got "++ show l ++ " bytes"
 
 ------------------------------------------------------------------------------
@@ -140,7 +151,8 @@ createTransport = do
   createNamedPipe filename $ unionFileModes ownerReadMode ownerWriteMode
   fd <- PIO.openFd filename PIO.ReadOnly Nothing fileFlags
   lock <- newMVar ()
-  void $ forkOS $ void . tryIO . asyncWhenCancelled closeTransport $ readFd state filename fd lock
+  void $ forkOS $ void . tryIO . asyncWhenCancelled closeTransport $
+    readFd state filename fd lock
   tryIO $ return Transport { newEndPoint    = apiNewEndPoint state filename
                            , closeTransport = apiCloseTransport state filename fd
                            }
@@ -170,7 +182,7 @@ apiNewEndPoint state filename = do
                             , address       = addr
                             , connect       = apiConnect addr state
                             , closeEndPoint = apiCloseEndPoint addr state
-                            , newMulticastGroup     = return . Left $ newMulticastGroupError
+                            , newMulticastGroup = return . Left $ newMulticastGroupError
                             , resolveMulticastGroup = return . Left . const resolveMulticastGroupError
                             }
   where
@@ -190,7 +202,8 @@ apiCloseEndPoint addr state =
 
 -- | Create a new connection
 apiConnect :: EndPointAddress -> MVar TransportState -> EndPointAddress
-           -> Reliability -> ConnectHints -> IO (Either (TransportError ConnectErrorCode) Connection)
+           -> Reliability -> ConnectHints
+           -> IO (Either (TransportError ConnectErrorCode) Connection)
 apiConnect myAddress state theirAddress _reliability _hints = do
   let (path, endId) = splitEndpoint theirAddress
   connAlive <- newMVar True
@@ -198,7 +211,9 @@ apiConnect myAddress state theirAddress _reliability _hints = do
     then connectToSelf (myAddress,theirAddress) state connAlive
     else do
     fd <- PIO.openFd path PIO.WriteOnly Nothing fileFlags
-    writeFd fd $ [encodeInt32 endId, encodeInt32 NewConnection, encodeAddress myAddress]
+    writeFd fd $ [encodeInt32 endId,
+                  encodeInt32 NewConnection,
+                  encodeAddress myAddress]
     return . Right $ Connection { send  = apiSend fd endId myAddress connAlive
                                 , close = apiClose fd endId myAddress connAlive
                                 }
@@ -213,10 +228,12 @@ connectToSelf ep@(myAddress,theirAddress) state connAlive = do
   writeChan chan $ ConnectionOpened (fromIntegral connId) ReliableOrdered myAddress
   return . Right $ Connection
       { send  = selfSend chan connId
-      , close = (modifyMVar_ state $ \st -> return $ removeConnection st ep) >> (selfClose chan connId)
+      , close = (modifyMVar_ state $ \st ->
+                  return $ removeConnection st ep) >> (selfClose chan connId)
       }
   where
-    selfSend :: Chan Event -> ConnectionId -> [ByteString] -> IO (Either (TransportError SendErrorCode) ())
+    selfSend :: Chan Event -> ConnectionId -> [ByteString]
+             -> IO (Either (TransportError SendErrorCode) ())
     selfSend chan connId msg = modifyMVar connAlive $ \alive -> do
       if alive
         then do
@@ -231,12 +248,13 @@ connectToSelf ep@(myAddress,theirAddress) state connAlive = do
       return False
 
 -- | Send a message over a connection
-apiSend :: Fd -> Int -> EndPointAddress -> MVar Bool -> [ByteString] -> IO (Either (TransportError SendErrorCode) ())
-apiSend fd endId addr connAlive msg =
+apiSend :: Fd -> Int -> EndPointAddress -> MVar Bool -> [ByteString]
+        -> IO (Either (TransportError SendErrorCode) ())
+apiSend fd endId myAddr connAlive msg =
   modifyMVar connAlive $ \alive ->
   if alive
   then do
-    let hdr = [encodeInt32 endId, encodeInt32 Data, encodeAddress addr]
+    let hdr = [encodeInt32 endId, encodeInt32 Data, encodeAddress myAddr]
     writeFd fd $ hdr ++ (prependLength msg)
     return (alive, Right ())
   else
@@ -244,16 +262,18 @@ apiSend fd endId addr connAlive msg =
 
 -- | Close a connection
 apiClose :: Fd -> Int -> EndPointAddress -> MVar Bool -> IO ()
-apiClose fd endId addr connAlive = do
+apiClose fd endId myAddr connAlive = do
   modifyMVar_ connAlive $ \alive -> do
     when alive $ do
-      writeFd fd [encodeInt32 endId, encodeInt32 CloseConnection, encodeAddress addr]
+      writeFd fd [encodeInt32 endId,
+                  encodeInt32 CloseConnection,
+                  encodeAddress myAddr]
       PIO.closeFd fd
     return False
 
 -- | Accessors for transport endpoints
 --
-accEndPoint :: TransportState -> (Map EndPointAddress (Chan Event) -> Map EndPointAddress (Chan Event)) -> TransportState
+accEndPoint :: TransportState -> (EndPointMap -> EndPointMap) -> TransportState
 accEndPoint st f = State { endpoints   = f (endpoints st)
                          , connections = connections st
                          }
@@ -287,23 +307,22 @@ encodeAddress x = BSC.append (encodeInt32  $ BSC.length addr) addr
 
 -- | Accessors for transport connections
 --
-accConnection :: TransportState -> (Map EndPointPair ConnectionId -> Map EndPointPair ConnectionId) -> TransportState
+accConnection :: TransportState -> (ConnectionMap -> ConnectionMap)
+              -> TransportState
 accConnection st f = State { endpoints   = endpoints st
                            , connections = f (connections st)
-                         }
+                           }
 
 -- Add a new connection, if it is not already present.
 addConnection :: TransportState -> EndPointPair -> (ConnectionId, TransportState)
-addConnection st p = 
-  case Map.lookup p (connections st) of
-    Just cid -> (cid, st)
-    Nothing -> (connId, accConnection st $ Map.insert p connId)
-      where
-        connId = fromIntegral $ Map.size (connections st) + 1
+addConnection st p = (connId, accConnection st $ Map.insert p connId)
+  where
+    connId = fromIntegral $ Map.size (connections st) + 1
 
 removeConnection :: TransportState -> EndPointPair -> TransportState
 removeConnection st p = accConnection st $ Map.delete p
 
 lookupConnection :: TransportState -> EndPointPair -> ConnectionId
-lookupConnection st a = Map.findWithDefault (error "Invalid Connection") a (connections st)
+lookupConnection st a = Map.findWithDefault (error "Invalid Connection") a
+                        (connections st)
 
